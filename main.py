@@ -70,8 +70,25 @@ async def receive_message(request: Request):
                         audio_bytes = descargar_media(media_id)
                         respuesta_final = transcribir_audio(audio_bytes)
 
+                    elif msg_type == "document":
+                        document = message.get("document", {})
+                        mime_type = document.get("mime_type")
+
+                        if mime_type == "application/pdf":
+                            media_id = document.get("id")
+                            pdf_bytes = descargar_media(media_id)
+
+                            temp_path = "/tmp/documento.pdf"
+                            with open(temp_path, "wb") as f:
+                                f.write(pdf_bytes)
+
+                            from services.ai_service import procesar_pdf
+                            respuesta_final = procesar_pdf(temp_path)
+                        else:
+                            respuesta_final = "Solo se soportan documentos PDF."
                     else:
                         respuesta_final = "Tipo de mensaje no soportado aún."
+
 
                     if respuesta_final:
                         enviar_mensaje_whatsapp(sender, respuesta_final)

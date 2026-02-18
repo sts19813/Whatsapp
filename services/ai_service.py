@@ -27,8 +27,9 @@ def procesar_pdf(path: str) -> str:
     texto = extraer_texto_pdf(path)
 
     response = client.responses.create(
-        model="gpt-4.1",
-        input=f"Resume o analiza este documento:\n\n{texto}"
+        model="gpt-4.1-mini",
+        input=f"Resume o analiza este documento:\n\n{texto}",
+        max_output_tokens=300
     )
 
     return response.output_text

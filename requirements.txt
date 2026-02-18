@@ -4,3 +4,4 @@ openai
 pymupdf
 python-multipart
 requests
+pillow
