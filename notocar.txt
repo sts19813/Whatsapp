@@ -1,0 +1,6 @@
+gcloud run deploy mi-asistente-web --source . --region us-central1 --allow-unauthenticated
+
+
+python -m venv venv
+pip install -r requirements.txt
+uvicorn main:app --reload
