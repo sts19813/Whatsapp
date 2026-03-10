@@ -1,89 +1,42 @@
 import json
 import os
-import tempfile
+import re
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, Request
 
-from services.ai_service import (
-    extraer_memoria_importante,
-    procesar_pdf,
-    responder_con_contexto,
-)
+from services.ai_service import analizar_intencion_taquilla
 from services.audio_service import transcribir_audio
+from services.chatbot_admin_service import ChatbotAdminClient, ChatbotAdminError, is_uuid
 from services.db_service import (
-    get_latest_location,
-    get_memory_value,
     get_memories,
+    get_memory_value,
     get_recent_messages,
     get_user,
     init_db,
-    save_location,
     save_message,
-    set_user_municipality,
     upsert_memory,
     upsert_user,
 )
 from services.image_service import procesar_imagen
-from services.tourism_service import (
-    estimate_drive_route,
-    enrich_places_with_distance,
-    filter_places,
-    find_best_place_match,
-    format_places_for_whatsapp,
-    geocode_place,
-    haversine_km,
-    infer_category,
-    infer_interest_topic,
-    is_exploratory_query,
-    maps_directions_link,
-    normalize_text,
-    travel_advice,
-    weather_label,
-    weather_snapshot,
-)
+
 
 app = FastAPI()
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "mi_webhook_verificacion_123")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+BOT_NAME = "Kiro AI Taquilla Admin"
 
-BASE_PATH = Path("base_turismo_yucatan_inventur.json")
-with BASE_PATH.open(encoding="utf-8") as f:
-    BASE_TURISMO = json.load(f)
+ADMIN_API = ChatbotAdminClient()
 
-BOT_NAME = "Kiro AI Turismo Yucatan"
-MUNICIPIOS_CLAVE = [
-    "merida",
-    "progreso",
-    "valladolid",
-    "celestun",
-    "tekax",
-    "tinum",
-    "muna",
-    "homun",
-    "izamal",
-]
-
-SYSTEM_PROMPT = """
-Eres un asesor de turismo de alto nivel, especializado unicamente en turismo en Yucatan.
-Habla como una IA natural, no como bot de respuestas rigidas.
-Tu prioridad es la mejor experiencia del viajero: claridad, utilidad, logistica, seguridad y contexto real.
-Siempre responde en idioma del usuario.
-
-Reglas:
-1) Mantente estrictamente en turismo de Yucatan. Si preguntan algo fuera de eso, redirige con elegancia al contexto turistico yucateco.
-2) Responde fluido y humano. No listes lugares automaticamente salvo que realmente aporte valor o el usuario lo pida.
-3) Si hay destino concreto, prioriza: como llegar, tiempo estimado, clima, precauciones, costos orientativos y siguiente mejor accion.
-4) Si faltan datos exactos, dilo claramente y propone la forma mas rapida de validarlo.
-5) Usa la fecha local proporcionada para interpretar "hoy", "estas fechas", "manana", etc.
-6) Responde breve por defecto (2-5 lineas). Solo extiende si el usuario pide detalle. no pongas # ni emojis en la respuesta
-""".strip()
+VALID_SCOPE_EVENTS = {"all", "upcoming", "past", "today"}
+VALID_SCOPE_AVAILABILITY = {"all", "upcoming", "today"}
+VALID_SALE_TYPE = {"all", "ticket", "registration"}
+JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*\})\s*```", re.IGNORECASE)
 
 
 @app.on_event("startup")
@@ -91,11 +44,91 @@ def on_startup() -> None:
     init_db()
 
 
-def detectar_municipio(texto: str) -> str | None:
-    t = normalize_text(texto)
-    for m in MUNICIPIOS_CLAVE:
-        if m in t:
-            return m.capitalize()
+def clamp(value: Any, min_value: int, max_value: int, default: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(min_value, min(max_value, parsed))
+
+
+def normalize_text(value: str) -> str:
+    return " ".join((value or "").strip().lower().split())
+
+
+def compact(value: Any, max_len: int = 220) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def safe_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def pick(data: dict[str, Any], *keys: str, default: Any = "") -> Any:
+    if not isinstance(data, dict):
+        return default
+
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return value
+
+    for nested_key in ("event", "sale", "registration"):
+        nested = data.get(nested_key)
+        if not isinstance(nested, dict):
+            continue
+        for key in keys:
+            value = nested.get(key)
+            if value not in (None, ""):
+                return value
+
+    return default
+
+
+def format_money(value: Any) -> str:
+    if value in (None, ""):
+        return "N/D"
+    try:
+        amount = float(value)
+    except Exception:
+        return str(value)
+    if amount.is_integer():
+        return f"${int(amount):,}"
+    return f"${amount:,.2f}"
+
+
+def extract_json_payload(text: str) -> dict[str, Any] | None:
+    content = (text or "").strip()
+    if not content:
+        return None
+
+    candidates: list[str] = []
+    block_match = JSON_BLOCK_RE.search(content)
+    if block_match:
+        candidates.append(block_match.group(1))
+
+    if content.startswith("{") and content.endswith("}"):
+        candidates.append(content)
+
+    first = content.find("{")
+    last = content.rfind("}")
+    if first >= 0 and last > first:
+        candidates.append(content[first : last + 1])
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
     return None
 
 
@@ -116,648 +149,768 @@ def contexto_fecha_actual() -> str:
         "noviembre",
         "diciembre",
     ]
-    dia_semana = dias[now.weekday()]
-    mes = meses[now.month - 1]
     return (
-        f"Fecha local actual confirmada: {dia_semana} {now.day} de {mes} de {now.year}. "
-        f"Hora local aproximada: {now.strftime('%H:%M')} (America/Mexico_City). "
-        "Si el usuario dice 'hoy', 'estas fechas' o similares, usa esta fecha exacta."
+        f"Fecha local: {dias[now.weekday()]} {now.day} de {meses[now.month - 1]} de {now.year}. "
+        f"Hora aprox: {now.strftime('%H:%M')} (America/Mexico_City)."
     )
-
-
-def construir_contexto_usuario(sender: str) -> str:
-    user = get_user(sender) or {}
-    memories = get_memories(sender, limit=10)
-    recent = get_recent_messages(sender, limit=12)
-    location = get_latest_location(sender)
-
-    memoria_txt = "\n".join([f"- {m['key']}: {m['value']}" for m in memories]) or "- (sin memoria)"
-    mensajes_txt = "\n".join([f"{m['role']}: {m['content']}" for m in recent]) or "(sin historial)"
-    loc_txt = f"lat={location['lat']}, lon={location['lon']}" if location else "sin ubicacion"
-
-    return (
-        f"Usuario: {sender}\n"
-        f"Municipio guardado: {user.get('municipality', 'sin definir')}\n"
-        f"Ubicacion actual: {loc_txt}\n"
-        f"Memorias:\n{memoria_txt}\n\n"
-        f"Historial reciente:\n{mensajes_txt}"
-    )
-
-
-def truncar_texto(texto: str, max_chars: int = 220) -> str:
-    clean = " ".join((texto or "").split())
-    if len(clean) <= max_chars:
-        return clean
-    return clean[: max_chars - 3] + "..."
 
 
 def contexto_compacto(sender: str) -> str:
     user = get_user(sender) or {}
-    memories = get_memories(sender, limit=12)
+    memories = get_memories(sender, limit=10)
     recent = get_recent_messages(sender, limit=6)
-    location = get_latest_location(sender)
 
-    memory_importantes = []
-    for m in memories:
-        key = (m.get("key") or "").strip()
-        if key in {"last_recommendations"}:
-            continue
-        memory_importantes.append(f"- {key}: {truncar_texto(m.get('value', ''), 120)}")
-
-    if get_memory_value(sender, "last_recommendations"):
-        memory_importantes.append("- last_recommendations: disponible")
-
-    recent_compacto = []
-    for msg in recent[-4:]:
-        role = msg.get("role", "user")
-        content = truncar_texto(msg.get("content", ""), 180)
-        recent_compacto.append(f"{role}: {content}")
-
-    loc_txt = f"{round(location['lat'], 5)}, {round(location['lon'], 5)}" if location else "sin ubicacion"
-    memories_txt = "\n".join(memory_importantes) or "- (sin datos)"
-    recent_txt = "\n".join(recent_compacto) or "(sin historial)"
+    memory_lines = [
+        f"- {m.get('key', '')}: {compact(m.get('value', ''), 120)}"
+        for m in memories
+        if (m.get("key") or "").strip()
+    ]
+    history_lines = [
+        f"{row.get('role', 'user')}: {compact(row.get('content', ''), 140)}"
+        for row in recent[-4:]
+    ]
 
     return (
-        f"municipio_preferido: {user.get('municipality', 'sin definir')}\n"
-        f"ubicacion_actual: {loc_txt}\n"
-        f"memoria_clave:\n{memories_txt}\n"
-        f"historial_corto:\n{recent_txt}"
+        f"{contexto_fecha_actual()}\n"
+        f"display_name: {user.get('display_name', 'sin nombre')}\n"
+        f"memoria:\n{chr(10).join(memory_lines) if memory_lines else '- (sin memoria)'}\n"
+        f"historial:\n{chr(10).join(history_lines) if history_lines else '(sin historial)'}"
     )
 
 
-def guardar_memoria_desde_texto(sender: str, text: str) -> None:
-    items = extraer_memoria_importante(text)
-    for item in items:
-        key = (item.get("key") or "").strip()
-        value = (item.get("value") or "").strip()
-        importance = int(item.get("importance") or 2)
-        if key and value:
-            upsert_memory(sender, key, value, max(1, min(importance, 5)))
+def remember_event(sender: str, event_id: str, event_name: str = "") -> None:
+    if not is_uuid(event_id):
+        return
+    upsert_memory(sender, "last_event_id", event_id, 5)
+    if event_name:
+        upsert_memory(sender, "last_event_name", event_name, 4)
 
 
-def obtener_lugares_relevantes(sender: str, consulta: str, limit: int = 5) -> list[dict[str, Any]]:
-    user = get_user(sender) or {}
-    municipality = user.get("municipality")
-    category_hint = infer_category(consulta)
-
-    lugares = filter_places(
-        places=BASE_TURISMO,
-        query=consulta,
-        municipality=municipality,
-        category_hint=category_hint,
-        limit=10,
-    )
-
-    if not lugares and municipality:
-        lugares = filter_places(
-            places=BASE_TURISMO,
-            query=consulta,
-            municipality=None,
-            category_hint=category_hint,
-            limit=max(10, limit + 3),
-        )
-
-    if not lugares:
-        return []
-
-    user_location = get_latest_location(sender)
-    lugares = enrich_places_with_distance(lugares, user_location)
-    return lugares[:limit]
+def extract_event_identity(item: dict[str, Any]) -> tuple[str, str]:
+    event_id = str(pick(item, "event_id", "id", "uuid", "event_uuid", default="")).strip()
+    event_name = str(pick(item, "event_name", "name", "title", default="")).strip()
+    return event_id, event_name
 
 
-def guardar_ultimas_recomendaciones(sender: str, lugares: list[dict[str, Any]]) -> None:
-    resumen = []
-    for p in lugares[:8]:
-        resumen.append(
-            {
-                "nombre": p.get("nombre", ""),
-                "categoria": p.get("categoria", ""),
-                "municipio": p.get("municipio", ""),
-                "direccion": p.get("direccion", ""),
-                "telefono": p.get("telefono", ""),
-                "web": p.get("web", ""),
-                "fuente_url": p.get("fuente_url", ""),
-            }
-        )
-    upsert_memory(sender, "last_recommendations", json.dumps(resumen, ensure_ascii=False), 4)
+def format_event_option(index: int, item: dict[str, Any]) -> str:
+    event_id, event_name = extract_event_identity(item)
+    event_date = pick(item, "start_at", "starts_at", "start_date", "date", "event_date")
+
+    parts = [f"{index}. {event_name or 'Evento'}"]
+    if event_date:
+        parts.append(f"fecha: {event_date}")
+    if event_id:
+        parts.append(f"id: {event_id}")
+    return " | ".join(parts)
 
 
-def cargar_ultimas_recomendaciones(sender: str) -> list[dict[str, Any]]:
-    raw = get_memory_value(sender, "last_recommendations")
-    if not raw:
-        return []
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+def resolve_event_id(
+    sender: str,
+    intent_data: dict[str, Any],
+    required: bool = True,
+) -> tuple[str, str]:
+    direct_event_id = str(intent_data.get("event_id") or "").strip()
+    if is_uuid(direct_event_id):
+        return direct_event_id, ""
+
+    event_query = str(intent_data.get("event_query") or intent_data.get("q") or "").strip()
+    if event_query:
+        payload = ADMIN_API.get_events(q=event_query, scope="all", limit=5)
+        rows = safe_list(payload.get("data"))
+
+        if not rows:
+            return "", f"No encontre eventos para: {event_query}"
+
+        if len(rows) == 1:
+            event_id, event_name = extract_event_identity(safe_dict(rows[0]))
+            if is_uuid(event_id):
+                remember_event(sender, event_id, event_name)
+                return event_id, ""
+
+        options = [format_event_option(i, safe_dict(row)) for i, row in enumerate(rows[:5], start=1)]
+        return "", "Encontre varios eventos. Indica el UUID exacto:\n" + "\n".join(options)
+
+    remembered = str(get_memory_value(sender, "last_event_id") or "").strip()
+    if is_uuid(remembered):
+        return remembered, ""
+
+    if required:
+        return "", "Necesito el event_id del evento. Primero puedes pedir: proximos eventos."
+    return "", ""
 
 
-def responder_mas_cercano(sender: str, consulta: str = "") -> str | None:
-    user_location = get_latest_location(sender)
-    if not user_location:
-        upsert_memory(sender, "pending_action", "resolve_nearest", 5)
-        return "Para decirte exacto cual te queda mas cerca, comparteme tu ubicacion actual en WhatsApp."
-
-    candidatos = cargar_ultimas_recomendaciones(sender)
-    if not candidatos:
-        if consulta:
-            candidatos = obtener_lugares_relevantes(sender, consulta, limit=5)
-        if not candidatos:
-            return "No tengo candidatos recientes. Dime que tipo de lugar buscas y te doy opciones cercanas."
-
-    mejores = []
-    for lugar in candidatos:
-        coords = geocode_place(lugar)
-        if not coords:
-            continue
-        dist = haversine_km(user_location["lat"], user_location["lon"], coords["lat"], coords["lon"])
-        item = dict(lugar)
-        item["distance_km"] = round(dist, 2)
-        mejores.append(item)
-
-    if not mejores:
-        return "No pude calcular distancia exacta con esos lugares. Te paso nuevas opciones si me dices el tipo de lugar."
-
-    mejores.sort(key=lambda x: x.get("distance_km", 999999.0))
-    top = mejores[0]
-    upsert_memory(sender, "destino_actual_nombre", top.get("nombre", ""), 5)
-    upsert_memory(sender, "destino_actual_municipio", top.get("municipio", ""), 4)
-    upsert_memory(sender, "pending_action", "none", 3)
-
-    mapas = (
-        f"https://www.google.com/maps/search/?api=1&query="
-        f"{top.get('nombre', '').replace(' ', '+')}+{top.get('direccion', '').replace(' ', '+')}"
-    )
-
-    extra = ""
-    if len(mejores) > 1:
-        alt = mejores[1]
-        extra = (
-            f"\nAlternativa cercana: {alt.get('nombre', 'N/D')} "
-            f"({alt.get('distance_km', 'N/D')} km aprox)."
-        )
-
+def respuesta_ayuda() -> str:
     return (
-        f"El que te queda mas cerca es *{top.get('nombre', 'N/D')}* "
-        f"({top.get('distance_km', 'N/D')} km aprox).\n"
-        f"Direccion: {top.get('direccion', 'N/D')}\n"
-        f"Maps: {mapas}{extra}\n\n"
-        "Si quieres, te digo cuanto tiempo haces en auto desde donde estas."
+        "Asistente de taquilla listo.\n\n"
+        "Consultas soportadas:\n"
+        "1) Eventos: resumen, proximos y detalle.\n"
+        "2) Disponibilidad: tickets, registros y items vendibles.\n"
+        "3) Ventas: overview, busqueda y ultimas ventas.\n"
+        "4) PDF: busqueda para reimpresion/reenvio.\n"
+        "5) Venta en efectivo: crea venta por /taquilla/sell-cash.\n\n"
+        "Ejemplos:\n"
+        "- Dame proximos eventos\n"
+        "- Disponibilidad del evento 0f33... (UUID)\n"
+        "- Buscar ventas por email cliente@dominio.com hoy\n"
+        "- Reenviar PDF de referencia ABC123\n"
+        "- Vender en efectivo con este JSON {event_id, buyer_name, buyer_email, cart}"
     )
 
 
-def recomendar_lugares(sender: str, consulta: str) -> str | None:
-    lugares = obtener_lugares_relevantes(sender, consulta, limit=5)
-    if not lugares:
-        return None
+def handle_events(sender: str, intent_data: dict[str, Any]) -> str:
+    q = str(intent_data.get("q") or intent_data.get("event_query") or "").strip()
+    scope = str(intent_data.get("scope") or "all").strip().lower()
+    if scope not in VALID_SCOPE_EVENTS:
+        scope = "all"
+    limit = clamp(intent_data.get("limit"), 1, 200, 10)
 
-    user = get_user(sender) or {}
-    municipality = user.get("municipality")
-    user_location = get_latest_location(sender)
-    guardar_ultimas_recomendaciones(sender, lugares)
-    texto_lugares = format_places_for_whatsapp(lugares, limit=5)
+    payload = ADMIN_API.get_events(q=q, scope=scope, limit=limit)
+    rows = safe_list(payload.get("data"))
+    if not rows:
+        return "No se encontraron eventos con ese filtro."
 
-    if not texto_lugares:
-        return None
+    first_id, first_name = extract_event_identity(safe_dict(rows[0]))
+    remember_event(sender, first_id, first_name)
 
-    prefijo = "Estas son recomendaciones en Yucatan"
-    if municipality:
-        prefijo = f"Estas son recomendaciones en/para {municipality}"
-    if user_location:
-        prefijo += " ordenadas por cercania cuando fue posible"
+    meta = safe_dict(payload.get("meta"))
+    total = pick(meta, "total", "count", "total_items", default="")
+    showing = min(len(rows), 8)
+    lines = [f"Eventos encontrados: {showing}{f' de {total}' if total else ''}"]
+    for i, row in enumerate(rows[:8], start=1):
+        item = safe_dict(row)
+        event_id, event_name = extract_event_identity(item)
+        event_date = pick(item, "start_at", "starts_at", "start_date", "date", "event_date")
+        available = pick(item, "tickets_available", "available_tickets", "stock_available")
+        sold = pick(item, "tickets_sold", "sold_tickets", "sales_count", "sold")
+        revenue = pick(item, "total_sales_amount", "sales_amount", "revenue", "total_amount")
 
-    return f"{prefijo}:\n\n{texto_lugares}"
+        pieces = [f"{i}. {event_name or 'Evento'}"]
+        if event_date:
+            pieces.append(f"fecha: {event_date}")
+        if available not in ("", None):
+            pieces.append(f"disp: {available}")
+        if sold not in ("", None):
+            pieces.append(f"vendidos: {sold}")
+        if revenue not in ("", None):
+            pieces.append(f"ventas: {format_money(revenue)}")
+        if event_id:
+            pieces.append(f"id: {event_id}")
+        lines.append(" | ".join(pieces))
 
-
-def resolver_destino(sender: str, consulta: str) -> dict[str, Any] | None:
-    user = get_user(sender) or {}
-    municipality = user.get("municipality")
-
-    place = find_best_place_match(BASE_TURISMO, consulta, municipality=municipality)
-    if not place:
-        place = find_best_place_match(BASE_TURISMO, consulta, municipality=None)
-
-    if place:
-        upsert_memory(sender, "destino_actual_nombre", place.get("nombre", ""), 5)
-        upsert_memory(sender, "destino_actual_municipio", place.get("municipio", ""), 4)
-        return place
-
-    saved_name = get_memory_value(sender, "destino_actual_nombre")
-    if saved_name:
-        remembered = find_best_place_match(BASE_TURISMO, saved_name, municipality=None)
-        if remembered:
-            return remembered
-
-    return None
+    return "\n".join(lines)
 
 
-def construir_info_destino_y_ruta(sender: str, destino: dict[str, Any]) -> dict[str, Any]:
-    user_location = get_latest_location(sender)
-    destino_coords = geocode_place(destino)
-    weather = None
-    route = None
-    directions = ""
+def handle_events_upcoming(sender: str, intent_data: dict[str, Any]) -> str:
+    q = str(intent_data.get("q") or intent_data.get("event_query") or "").strip()
+    limit = clamp(intent_data.get("limit"), 1, 200, 10)
 
-    if destino_coords:
-        weather = weather_snapshot(destino_coords["lat"], destino_coords["lon"])
-        if user_location:
-            route = estimate_drive_route(user_location, destino_coords)
-            directions = maps_directions_link(user_location, destino_coords)
+    payload = ADMIN_API.get_events_upcoming(q=q, limit=limit)
+    rows = safe_list(payload.get("data"))
+    if not rows:
+        return "No hay proximos eventos para ese filtro."
 
-    return {
-        "user_location": user_location,
-        "destino_coords": destino_coords,
-        "weather": weather,
-        "route": route,
-        "directions": directions,
+    first_id, first_name = extract_event_identity(safe_dict(rows[0]))
+    remember_event(sender, first_id, first_name)
+
+    lines = [f"Proximos eventos ({min(len(rows), 8)}):"]
+    for i, row in enumerate(rows[:8], start=1):
+        item = safe_dict(row)
+        event_id, event_name = extract_event_identity(item)
+        event_date = pick(item, "start_at", "starts_at", "start_date", "date", "event_date")
+        pieces = [f"{i}. {event_name or 'Evento'}"]
+        if event_date:
+            pieces.append(f"fecha: {event_date}")
+        if event_id:
+            pieces.append(f"id: {event_id}")
+        lines.append(" | ".join(pieces))
+    return "\n".join(lines)
+
+
+def handle_event_detail(sender: str, intent_data: dict[str, Any]) -> str:
+    event_id, issue = resolve_event_id(sender, intent_data, required=True)
+    if issue:
+        return issue
+
+    payload = ADMIN_API.get_event_detail(event_id)
+    event = safe_dict(payload.get("event"))
+    ticket_breakdown = safe_list(payload.get("ticket_breakdown"))
+    registration = safe_dict(payload.get("registration_breakdown"))
+
+    event_name = str(pick(event, "name", "event_name", "title", default="")).strip() or event_id
+    remember_event(sender, event_id, event_name)
+
+    lines = [f"Detalle evento: {event_name}", f"id: {event_id}"]
+
+    event_date = pick(event, "start_at", "starts_at", "start_date", "date")
+    venue = pick(event, "venue", "venue_name", "location")
+    status = pick(event, "status", "event_status")
+    if event_date:
+        lines.append(f"fecha: {event_date}")
+    if venue:
+        lines.append(f"sede: {venue}")
+    if status:
+        lines.append(f"estatus: {status}")
+
+    if ticket_breakdown:
+        lines.append("Tickets:")
+        for item in ticket_breakdown[:8]:
+            row = safe_dict(item)
+            ticket_id = pick(row, "id", "ticket_id", "uuid", default="")
+            ticket_name = pick(row, "name", "ticket_name", "label", "concept", default="Ticket")
+            price = pick(row, "unit_price", "price", default="")
+            stock = pick(row, "stock_available", "available", "remaining", default="")
+            sold = pick(row, "sold", "sold_count", "sold_qty", default="")
+            can_sell = pick(row, "can_sell_cash", default="")
+
+            parts = [f"- {ticket_name}"]
+            if ticket_id:
+                parts.append(f"id: {ticket_id}")
+            if price not in ("", None):
+                parts.append(f"precio: {format_money(price)}")
+            if stock not in ("", None):
+                parts.append(f"disp: {stock}")
+            if sold not in ("", None):
+                parts.append(f"vendidos: {sold}")
+            if can_sell not in ("", None):
+                parts.append(f"cash: {'si' if bool(can_sell) else 'no'}")
+            lines.append(" | ".join(parts))
+    else:
+        lines.append("Tickets: sin desglose disponible.")
+
+    if registration:
+        reg_enabled = pick(registration, "enabled", default="")
+        reg_price = pick(registration, "unit_price", "price", default="")
+        reg_slots = pick(registration, "slots_available", "available_slots", "remaining", default="")
+        reg_can_sell = pick(registration, "can_sell_cash", default="")
+        reg_parts = ["Registro:"]
+        if reg_enabled not in ("", None):
+            reg_parts.append(f"habilitado: {'si' if bool(reg_enabled) else 'no'}")
+        if reg_price not in ("", None):
+            reg_parts.append(f"precio: {format_money(reg_price)}")
+        if reg_slots not in ("", None):
+            reg_parts.append(f"cupos: {reg_slots}")
+        if reg_can_sell not in ("", None):
+            reg_parts.append(f"cash: {'si' if bool(reg_can_sell) else 'no'}")
+        lines.append(" | ".join(reg_parts))
+    else:
+        lines.append("Registro: sin desglose disponible.")
+
+    return "\n".join(lines)
+
+
+def handle_availability(sender: str, intent_data: dict[str, Any]) -> str:
+    requested_event = str(intent_data.get("event_id") or "").strip()
+    event_id = requested_event if is_uuid(requested_event) else ""
+    q = str(intent_data.get("q") or intent_data.get("event_query") or "").strip()
+    scope = str(intent_data.get("scope") or "upcoming").strip().lower()
+    if scope not in VALID_SCOPE_AVAILABILITY:
+        scope = "upcoming"
+    limit = clamp(intent_data.get("limit"), 1, 200, 10)
+
+    if not event_id and not q:
+        remembered = str(get_memory_value(sender, "last_event_id") or "").strip()
+        if is_uuid(remembered):
+            event_id = remembered
+
+    payload = ADMIN_API.get_availability(event_id=event_id, q=q, scope=scope, limit=limit)
+    rows = safe_list(payload.get("data"))
+    if not rows:
+        return "No hay disponibilidad para ese filtro."
+
+    first_id, first_name = extract_event_identity(safe_dict(rows[0]))
+    remember_event(sender, first_id, first_name)
+
+    lines = [f"Disponibilidad ({min(len(rows), 5)} eventos):"]
+    for i, raw in enumerate(rows[:5], start=1):
+        row = safe_dict(raw)
+        current_event_id, current_event_name = extract_event_identity(row)
+        title = f"{i}. {current_event_name or 'Evento'}"
+        if current_event_id:
+            title += f" | id: {current_event_id}"
+        lines.append(title)
+
+        tickets = safe_list(row.get("tickets"))
+        if tickets:
+            lines.append("Tickets:")
+            for ticket_raw in tickets[:8]:
+                ticket = safe_dict(ticket_raw)
+                ticket_id = pick(ticket, "id", "ticket_id", "uuid", default="")
+                ticket_name = pick(ticket, "name", "label", "ticket_name", default="Ticket")
+                unit_price = pick(ticket, "unit_price", "price", default="")
+                stock = pick(ticket, "stock_available", "available", "remaining", default="")
+                can_sell_cash = pick(ticket, "can_sell_cash", default="")
+
+                parts = [f"- {ticket_name}"]
+                if ticket_id:
+                    parts.append(f"id: {ticket_id}")
+                if unit_price not in ("", None):
+                    parts.append(f"precio: {format_money(unit_price)}")
+                if stock not in ("", None):
+                    parts.append(f"disp: {stock}")
+                if can_sell_cash not in ("", None):
+                    parts.append(f"cash: {'si' if bool(can_sell_cash) else 'no'}")
+                lines.append(" | ".join(parts))
+        else:
+            lines.append("Tickets: sin items.")
+
+        registration = safe_dict(row.get("registration"))
+        if registration:
+            enabled = pick(registration, "enabled", default="")
+            price = pick(registration, "unit_price", "price", default="")
+            slots = pick(registration, "slots_available", "available_slots", "remaining", default="")
+            can_sell_cash = pick(registration, "can_sell_cash", default="")
+
+            reg_parts = ["Registro:"]
+            if enabled not in ("", None):
+                reg_parts.append(f"habilitado: {'si' if bool(enabled) else 'no'}")
+            if price not in ("", None):
+                reg_parts.append(f"precio: {format_money(price)}")
+            if slots not in ("", None):
+                reg_parts.append(f"cupos: {slots}")
+            if can_sell_cash not in ("", None):
+                reg_parts.append(f"cash: {'si' if bool(can_sell_cash) else 'no'}")
+            lines.append(" | ".join(reg_parts))
+
+        sellable_items = safe_list(row.get("sellable_items"))
+        if sellable_items:
+            render = []
+            for sellable_raw in sellable_items[:8]:
+                sellable = safe_dict(sellable_raw)
+                item_type = str(pick(sellable, "type", default="item"))
+                item_id = str(pick(sellable, "id", "ticket_id", default="")).strip()
+                item_name = str(pick(sellable, "name", "label", "concept", default="")).strip()
+                label = f"{item_type}:{item_id}" if item_id else item_type
+                if item_name:
+                    label = f"{label} ({item_name})"
+                render.append(label)
+            lines.append("Items vendibles: " + "; ".join(render))
+
+    lines.append("Tip: usa los ids de tickets para ejecutar venta en efectivo.")
+    return "\n".join(lines)
+
+
+def handle_sales_overview(sender: str, intent_data: dict[str, Any]) -> str:
+    requested_event = str(intent_data.get("event_id") or "").strip()
+    event_id = requested_event if is_uuid(requested_event) else ""
+    if not event_id and (intent_data.get("event_query") or intent_data.get("q")):
+        event_id, issue = resolve_event_id(sender, intent_data, required=False)
+        if issue:
+            return issue
+
+    date_exact = str(intent_data.get("date") or "").strip()
+    date_from = str(intent_data.get("from") or "").strip()
+    date_to = str(intent_data.get("to") or "").strip()
+    if date_exact and not date_from and not date_to:
+        date_from = date_exact
+        date_to = date_exact
+
+    payload = ADMIN_API.get_sales_overview(event_id=event_id, date_from=date_from, date_to=date_to)
+    overview = safe_dict(payload.get("data")) if isinstance(payload.get("data"), dict) else safe_dict(payload)
+    if not overview:
+        return "No se pudo construir el overview de ventas."
+
+    lines = ["Resumen global de ventas:"]
+    if event_id:
+        lines.append(f"event_id: {event_id}")
+    if date_from or date_to:
+        lines.append(f"rango: {date_from or 'inicio'} -> {date_to or 'fin'}")
+
+    used = set()
+    known_fields = [
+        ("total_amount", "Monto total"),
+        ("total_count", "Total operaciones"),
+        ("total_items", "Total items"),
+        ("ticket_amount", "Monto tickets"),
+        ("ticket_count", "Tickets vendidos"),
+        ("registration_amount", "Monto registros"),
+        ("registration_count", "Registros"),
+    ]
+    for key, label in known_fields:
+        value = overview.get(key)
+        if value in (None, ""):
+            continue
+        used.add(key)
+        if "amount" in key or "monto" in key:
+            lines.append(f"- {label}: {format_money(value)}")
+        else:
+            lines.append(f"- {label}: {value}")
+
+    for key, value in overview.items():
+        if key in used:
+            continue
+        if isinstance(value, (dict, list)):
+            continue
+        if value in (None, ""):
+            continue
+        label = key.replace("_", " ")
+        if any(token in key for token in ("amount", "price", "revenue", "total")):
+            lines.append(f"- {label}: {format_money(value)}")
+        else:
+            lines.append(f"- {label}: {value}")
+
+    return "\n".join(lines)
+
+
+def _resolve_event_for_sales(sender: str, intent_data: dict[str, Any]) -> tuple[str, str]:
+    requested_event = str(intent_data.get("event_id") or "").strip()
+    if is_uuid(requested_event):
+        return requested_event, ""
+    if intent_data.get("event_query") or intent_data.get("q"):
+        return resolve_event_id(sender, intent_data, required=False)
+
+    remembered = str(get_memory_value(sender, "last_event_id") or "").strip()
+    if is_uuid(remembered):
+        return remembered, ""
+    return "", ""
+
+
+def handle_sales_latest(sender: str, intent_data: dict[str, Any]) -> str:
+    event_id, issue = _resolve_event_for_sales(sender, intent_data)
+    if issue:
+        return issue
+
+    limit = clamp(intent_data.get("limit"), 1, 50, 10)
+    payload = ADMIN_API.get_sales_latest(event_id=event_id, limit=limit)
+    rows = safe_list(payload.get("data"))
+    if not rows:
+        return "No hay ventas recientes con ese filtro."
+
+    lines = [f"Ultimas ventas ({min(len(rows), 8)}):"]
+    for i, raw in enumerate(rows[:8], start=1):
+        row = safe_dict(raw)
+        customer_name = pick(row, "customer_name", "name", default="Cliente")
+        email = pick(row, "customer_email", "email", default="")
+        price = pick(row, "price", "amount", default="")
+        sold_at = pick(row, "sold_at", "created_at", "date", default="")
+        reference = pick(row, "reference", default="")
+        pdf_url = pick(row, "pdf_url", "reprint_pdf_url", default="")
+
+        lines.append(f"{i}. {customer_name} | {format_money(price)} | {sold_at or 'sin fecha'}")
+        if email:
+            lines.append(f"   email: {email}")
+        if reference:
+            lines.append(f"   referencia: {reference}")
+        if pdf_url:
+            lines.append(f"   pdf: {pdf_url}")
+
+    return "\n".join(lines)
+
+
+def handle_sales_search(sender: str, intent_data: dict[str, Any], pdf_only: bool = False) -> str:
+    sale_type = str(intent_data.get("sale_type") or "all").strip().lower()
+    if sale_type not in VALID_SALE_TYPE:
+        sale_type = "all"
+
+    q = str(intent_data.get("q") or "").strip()
+    reference = str(intent_data.get("reference") or "").strip()
+    if reference and not q:
+        q = reference
+
+    name = str(intent_data.get("name") or "").strip()
+    email = str(intent_data.get("email") or "").strip()
+    date_exact = str(intent_data.get("date") or "").strip()
+    date_from = str(intent_data.get("from") or "").strip()
+    date_to = str(intent_data.get("to") or "").strip()
+    if date_exact and (date_from or date_to):
+        date_exact = ""
+
+    event_id, issue = _resolve_event_for_sales(sender, intent_data)
+    if issue:
+        return issue
+
+    limit = clamp(intent_data.get("limit"), 1, 200, 20)
+    payload = ADMIN_API.search_sales(
+        sale_type=sale_type,
+        q=q,
+        name=name,
+        email=email,
+        event_id=event_id,
+        exact_date=date_exact,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+
+    rows = safe_list(payload.get("data"))
+    if pdf_only:
+        rows = [row for row in rows if pick(safe_dict(row), "pdf_url", "reprint_pdf_url", default="")]
+
+    if not rows:
+        if pdf_only:
+            return "No encontre ventas con PDF para esos filtros."
+        return "No encontre ventas con esos filtros."
+
+    lines = [f"Resultados ventas ({min(len(rows), 10)}):"]
+    for i, raw in enumerate(rows[:10], start=1):
+        row = safe_dict(raw)
+        sale_mode = pick(row, "sale_type", "type", default="sale")
+        customer_name = pick(row, "customer_name", "name", default="Cliente")
+        concept = pick(row, "concept", default="concepto")
+        price = pick(row, "price", "amount", default="")
+        sold_at = pick(row, "sold_at", "created_at", default="")
+        reference_value = pick(row, "reference", default="")
+        pdf_url = pick(row, "pdf_url", "reprint_pdf_url", default="")
+        customer_email = pick(row, "customer_email", "email", default="")
+        event_name = pick(row, "event_name", "name", default="")
+        event_id = str(pick(row, "event_id", default="")).strip()
+
+        if is_uuid(event_id):
+            remember_event(sender, event_id, str(event_name))
+
+        lines.append(
+            f"{i}. {sale_mode} | {customer_name} | {concept} | {format_money(price)} | {sold_at or 'sin fecha'}"
+        )
+        if reference_value:
+            lines.append(f"   referencia: {reference_value}")
+        if customer_email:
+            lines.append(f"   email: {customer_email}")
+        if event_name:
+            lines.append(f"   evento: {event_name}")
+        if pdf_url:
+            lines.append(f"   pdf: {pdf_url}")
+
+    if pdf_only:
+        lines.append("Usa el campo pdf para reenviar por WhatsApp.")
+    return "\n".join(lines)
+
+
+def normalize_cart_items(raw_cart: Any) -> tuple[list[dict[str, Any]], str]:
+    items = []
+    for raw_item in safe_list(raw_cart):
+        item = safe_dict(raw_item)
+        item_type = str(item.get("type") or "").strip().lower()
+        qty = clamp(item.get("qty"), 1, 9999, 1)
+
+        if item_type == "ticket":
+            item_id = str(item.get("id") or "").strip()
+            if not item_id:
+                return [], "Cada item de tipo ticket requiere id."
+            items.append({"type": "ticket", "id": item_id, "qty": qty})
+            continue
+
+        if item_type == "registration":
+            normalized = {"type": "registration", "qty": qty}
+            if item.get("price") not in (None, ""):
+                try:
+                    normalized["price"] = float(item.get("price"))
+                except Exception:
+                    return [], "El campo price en registration debe ser numerico."
+            items.append(normalized)
+            continue
+
+        return [], "Tipo de item invalido en cart. Usa ticket o registration."
+
+    if not items:
+        return [], "Cart vacio. Incluye al menos un item ticket o registration."
+    return items, ""
+
+
+def build_sell_payload(
+    sender: str,
+    text: str,
+    intent_data: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    parsed_payload = extract_json_payload(text) or {}
+
+    requested_event = str(parsed_payload.get("event_id") or intent_data.get("event_id") or "").strip()
+    event_id = requested_event if is_uuid(requested_event) else ""
+    if not event_id:
+        if intent_data.get("event_query") or intent_data.get("q"):
+            event_id, issue = resolve_event_id(sender, intent_data, required=True)
+            if issue:
+                return None, issue
+        else:
+            remembered = str(get_memory_value(sender, "last_event_id") or "").strip()
+            if is_uuid(remembered):
+                event_id = remembered
+    if not event_id:
+        return None, "Necesito event_id valido para vender en efectivo."
+
+    buyer_name = str(parsed_payload.get("buyer_name") or intent_data.get("buyer_name") or "").strip()
+    buyer_email = str(parsed_payload.get("buyer_email") or intent_data.get("buyer_email") or "").strip()
+    buyer_phone = str(parsed_payload.get("buyer_phone") or intent_data.get("buyer_phone") or "").strip()
+
+    if not buyer_name:
+        return None, "Falta buyer_name para crear la venta."
+    if not buyer_email:
+        return None, "Falta buyer_email para crear la venta."
+
+    cart_input = parsed_payload.get("cart")
+    if not isinstance(cart_input, list):
+        cart_input = intent_data.get("cart")
+    cart, cart_error = normalize_cart_items(cart_input)
+    if cart_error:
+        return None, cart_error
+
+    payload: dict[str, Any] = {
+        "event_id": event_id,
+        "buyer_name": buyer_name,
+        "buyer_email": buyer_email,
+        "cart": cart,
     }
+    if buyer_phone:
+        payload["buyer_phone"] = buyer_phone
+    if isinstance(parsed_payload.get("registration_form"), dict):
+        payload["registration_form"] = parsed_payload["registration_form"]
+
+    return payload, ""
 
 
-def responder_logistica(sender: str, consulta: str, destino_hint: str = "") -> str | None:
-    destino = resolver_destino(sender, destino_hint or consulta)
-    if not destino:
+def handle_sell_cash(sender: str, text: str, intent_data: dict[str, Any]) -> str:
+    payload, issue = build_sell_payload(sender, text, intent_data)
+    if issue:
+        return issue
+    assert payload is not None
+
+    response = ADMIN_API.sell_cash(payload)
+    sale = safe_dict(response.get("sale"))
+    items = safe_dict(response.get("items"))
+
+    reference = pick(sale, "reference", default="")
+    total_amount = pick(sale, "total_amount", "amount", "total", default="")
+    total_items = pick(sale, "total_items", "items_count", default="")
+    reprint_pdf = pick(sale, "reprint_pdf_url", "pdf_url", default="")
+
+    if reference:
+        upsert_memory(sender, "last_sale_reference", str(reference), 4)
+    if reprint_pdf:
+        upsert_memory(sender, "last_sale_pdf_url", str(reprint_pdf), 4)
+
+    lines = ["Venta en efectivo creada."]
+    if reference:
+        lines.append(f"referencia: {reference}")
+    if total_amount not in ("", None):
+        lines.append(f"total: {format_money(total_amount)}")
+    if total_items not in ("", None):
+        lines.append(f"items: {total_items}")
+    if reprint_pdf:
+        lines.append(f"pdf reimpresion: {reprint_pdf}")
+
+    ticket_items = safe_list(items.get("tickets"))
+    registration_items = safe_list(items.get("registrations"))
+    if ticket_items or registration_items:
+        lines.append("Desglose:")
+        for raw in ticket_items[:10]:
+            row = safe_dict(raw)
+            name = pick(row, "name", "ticket_name", "concept", default="ticket")
+            qty = pick(row, "qty", "quantity", default="")
+            price = pick(row, "unit_price", "price", default="")
+            detail = f"- ticket {name}"
+            if qty not in ("", None):
+                detail += f" x{qty}"
+            if price not in ("", None):
+                detail += f" ({format_money(price)})"
+            lines.append(detail)
+        for raw in registration_items[:10]:
+            row = safe_dict(raw)
+            qty = pick(row, "qty", "quantity", default="")
+            price = pick(row, "unit_price", "price", default="")
+            detail = "- registration"
+            if qty not in ("", None):
+                detail += f" x{qty}"
+            if price not in ("", None):
+                detail += f" ({format_money(price)})"
+            lines.append(detail)
+
+    return "\n".join(lines)
+
+
+def infer_intent_fallback(text: str) -> str:
+    t = normalize_text(text)
+
+    if any(word in t for word in ("ayuda", "comandos", "que puedes", "como funciona")):
+        return "help"
+    if "proximo" in t and "evento" in t:
+        return "events_upcoming"
+    if "detalle" in t and "evento" in t:
+        return "event_detail"
+    if any(word in t for word in ("disponibilidad", "boleto disponible", "stock", "taquilla")):
+        return "availability"
+    if "overview" in t or ("resumen" in t and "venta" in t):
+        return "sales_overview"
+    if ("ultimas" in t or "ultimos" in t or "recientes" in t) and "venta" in t:
+        return "sales_latest"
+    if any(word in t for word in ("pdf", "reimpresion", "reenviar", "reenvio")):
+        return "pdf_lookup"
+    if "buscar" in t and "venta" in t:
+        return "sales_search"
+    if any(word in t for word in ("vender", "venta en efectivo", "sell-cash")):
+        return "sell_cash"
+    if "evento" in t:
+        return "events"
+    return "unknown"
+
+
+def procesar_texto_taquilla(sender: str, text: str, message_type: str = "text") -> str:
+    contenido = (text or "").strip()
+    if not contenido:
+        return "No recibi texto. Intenta de nuevo."
+
+    first_turn = len(get_recent_messages(sender, limit=1)) == 0
+    save_message(sender, "user", contenido, message_type)
+
+    if first_turn and normalize_text(contenido) in {"hola", "buenas", "hello", "hi"}:
         return (
-            "Entiendo que quieres ruta/logistica. Dime el nombre exacto del lugar en Yucatan "
-            "(ejemplo: Marina Paraiso Progreso) para darte tiempo, ruta, clima y precauciones."
+            "Hola. Soy tu asistente de taquilla para admin.\n\n"
+            "Puedo consultar eventos, disponibilidad, ventas y links PDF de reimpresion.\n"
+            "Escribe ayuda para ver ejemplos."
         )
 
-    info = construir_info_destino_y_ruta(sender, destino)
-    user_location = info["user_location"]
-    if not user_location:
+    if not ADMIN_API.base_url:
+        return "Config faltante: CHATBOT_ADMIN_BASE_URL."
+    if not ADMIN_API.token:
+        return "Config faltante: CHATBOT_ADMIN_TOKEN."
+
+    intent_data: dict[str, Any]
+    try:
+        intent_data = analizar_intencion_taquilla(contexto_compacto(sender), contenido)
+    except Exception:
+        intent_data = {}
+
+    if not isinstance(intent_data, dict):
+        intent_data = {}
+
+    intent = str(intent_data.get("intent") or "").strip().lower()
+    if not intent or intent == "unknown":
+        intent = infer_intent_fallback(contenido)
+        intent_data["intent"] = intent
+
+    needs_clarification = bool(intent_data.get("needs_clarification"))
+    clarification_question = str(intent_data.get("clarification_question") or "").strip()
+    if needs_clarification and clarification_question:
+        return clarification_question
+
+    try:
+        if intent == "help":
+            return respuesta_ayuda()
+        if intent == "events":
+            return handle_events(sender, intent_data)
+        if intent == "events_upcoming":
+            return handle_events_upcoming(sender, intent_data)
+        if intent == "event_detail":
+            return handle_event_detail(sender, intent_data)
+        if intent == "availability":
+            return handle_availability(sender, intent_data)
+        if intent == "sales_overview":
+            return handle_sales_overview(sender, intent_data)
+        if intent == "sales_search":
+            return handle_sales_search(sender, intent_data, pdf_only=False)
+        if intent == "sales_latest":
+            return handle_sales_latest(sender, intent_data)
+        if intent == "pdf_lookup":
+            return handle_sales_search(sender, intent_data, pdf_only=True)
+        if intent == "sell_cash":
+            return handle_sell_cash(sender, contenido, intent_data)
+
         return (
-            f"Ya identifique tu destino: {destino.get('nombre', 'lugar seleccionado')}.\n"
-            "Comparte tu ubicacion en WhatsApp y te doy tiempo estimado en auto, distancia, "
-            "ruta de Google Maps y recomendaciones de clima/seguridad."
+            "No pude identificar la accion exacta.\n"
+            "Puedes pedir ayuda o usar comandos como: proximos eventos, disponibilidad, ventas, pdf o vender."
         )
-
-    destino_coords = info["destino_coords"]
-    if not destino_coords:
-        maps_search = destino.get("fuente_url") or destino.get("web") or "https://www.google.com/maps"
-        return (
-            f"Ubique el destino {destino.get('nombre', '')}, pero no pude geocodificar coordenadas exactas.\n"
-            f"Te dejo referencia: {maps_search}\n"
-            "Si me compartes una direccion mas exacta, te calculo tiempo y distancia."
-        )
-
-    route = info["route"]
-    directions = info["directions"]
-    weather = info["weather"]
-
-    clima_txt = "Sin datos de clima en este momento."
-    if weather:
-        code = int(weather.get("weather_code", -1))
-        clima_txt = (
-            f"{weather_label(code)} | {weather.get('temperature_2m', 'N/D')} C | "
-            f"precipitacion {weather.get('precipitation', 'N/D')} mm | "
-            f"viento {weather.get('wind_speed_10m', 'N/D')} km/h"
-        )
-
-    consejo = travel_advice(weather)
-    origen_txt = f"{round(user_location['lat'], 5)}, {round(user_location['lon'], 5)}"
-
-    return (
-        f"Ruta hacia *{destino.get('nombre', 'Destino')}* ({destino.get('municipio', 'Yucatan')}):\n\n"
-        f"- Distancia estimada: {route['distance_km']} km\n"
-        f"- Tiempo en auto: {route['duration_min']} min aprox\n"
-        f"- Origen detectado: {origen_txt}\n"
-        f"- Navegacion: {directions}\n"
-        f"- Clima actual destino: {clima_txt}\n"
-        f"- Precauciones: {consejo}\n\n"
-        "Si quieres, te calculo tambien una hora recomendada de salida para evitar calor o lluvia."
-    )
-
-
-def responder_detalle_destino(sender: str, consulta: str, destino_hint: str = "") -> str | None:
-    destino = resolver_destino(sender, destino_hint or consulta)
-    if not destino:
-        return None
-
-    info = construir_info_destino_y_ruta(sender, destino)
-    weather = info["weather"]
-    route = info["route"]
-    user = get_user(sender) or {}
-    memory_lines = contexto_compacto(sender)
-
-    clima_txt = "No disponible"
-    if weather:
-        code = int(weather.get("weather_code", -1))
-        clima_txt = (
-            f"{weather_label(code)} | {weather.get('temperature_2m', 'N/D')} C | "
-            f"precipitacion {weather.get('precipitation', 'N/D')} mm | "
-            f"viento {weather.get('wind_speed_10m', 'N/D')} km/h"
-        )
-
-    route_txt = "No disponible"
-    if route:
-        route_txt = f"{route['distance_km']} km y {route['duration_min']} min aprox"
-
-    consejo = travel_advice(weather)
-
-    style_inst = obtener_instrucciones_estilo(sender)
-    prompt_usuario = f"""
-{contexto_fecha_actual()}
-
-Consulta actual:
-{consulta}
-
-Perfil usuario:
-- municipio_preferido: {user.get('municipality', 'sin definir')}
-{memory_lines}
-
-Destino seleccionado:
-- nombre: {destino.get('nombre', '')}
-- categoria: {destino.get('categoria', '')}
-- municipio: {destino.get('municipio', '')}
-- direccion: {destino.get('direccion', '')}
-- telefono: {destino.get('telefono', '')}
-- web: {destino.get('web', '')}
-- fuente: {destino.get('fuente_url', '')}
-
-Logistica:
-- ruta estimada: {route_txt}
-- navegacion: {info.get('directions', '') or 'no disponible'}
-- clima actual destino: {clima_txt}
-- precauciones base: {consejo}
-
-Responde en tono natural, como asistente personal.
-No regreses una lista de recomendaciones.
-Enfocate en valor practico para este destino: costos estimados, mejores horarios, tips para familia/ninos si aplica, seguridad, que llevar, y siguiente mejor accion.
-Si un dato no existe en la base, dilo y sugiere como validarlo rapido.
-{style_inst}
-"""
-    return responder_con_contexto(SYSTEM_PROMPT, prompt_usuario, smart=True, max_output_tokens=260)
-
-
-def responder_tema_turistico(sender: str, consulta: str) -> str | None:
-    topic = infer_interest_topic(consulta)
-    if not topic:
-        return None
-
-    user = get_user(sender) or {}
-    municipality = user.get("municipality")
-    muestras = obtener_lugares_relevantes(sender, topic, limit=3)
-
-    ejemplos = "\n".join(
-        [f"- {p.get('nombre', '')} ({p.get('municipio', '')})" for p in muestras]
-    ) or "- Sin ejemplos cercanos en base"
-
-    memory_lines = contexto_compacto(sender)
-
-    style_inst = obtener_instrucciones_estilo(sender)
-    prompt = f"""
-{contexto_fecha_actual()}
-
-Usuario pregunta:
-{consulta}
-
-Tema principal detectado: {topic}
-Municipio preferido: {municipality or "sin definir"}
-Memorias de contexto:
-{memory_lines}
-
-Ejemplos en la base local:
-{ejemplos}
-
-Responde como asesor turistico conversacional (no como bot de listado).
-Da informacion precisa y practica del tema en Yucatan: mejores epocas, costos orientativos, seguridad, logistica, que llevar, errores comunes y como aprovechar mejor la visita.
-Si no hay dato exacto (precio/horario), dilo y propone como validarlo rapido.
-Cierra con una sola pregunta de seguimiento util.
-{style_inst}
-"""
-    return responder_con_contexto(SYSTEM_PROMPT, prompt, smart=True, max_output_tokens=240)
-
-
-def respuesta_primer_mensaje(sender: str, display_name: str | None = None) -> str:
-    upsert_user(sender, display_name=display_name)
-    upsert_memory(sender, "primer_contacto", "Usuario inicio conversacion", 3)
-    return (
-        "Hola, soy Kiro AI, tu asistente de turismo en Yucatan.\n\n"
-        "Ya guarde tu perfil inicial para personalizar recomendaciones.\n"
-        "Comparte tu ubicacion de WhatsApp para recomendar lugares cercanos con distancia y links de Maps.\n\n"
-        "Tambien puedes decirme: presupuesto, intereses (cenotes, gastronomia, arqueologia),"
-        " movilidad y si viajas con familia/pareja."
-    )
-
-
-def es_peticion_explicita_de_recomendacion(text: str) -> bool:
-    t = normalize_text(text)
-    triggers = [
-        "recomiend",
-        "lugares para",
-        "donde comer",
-        "quiero opciones",
-        "sugerencias",
-        "que lugares",
-        "que me recomiendas",
-        "cerca de mi",
-    ]
-    return any(k in t for k in triggers)
-
-
-def es_pregunta_meta(text: str) -> bool:
-    t = normalize_text(text)
-    claves = [
-        "quien te creo",
-        "que modelo eres",
-        "eres chatgpt",
-        "quien eres",
-    ]
-    return any(k in t for k in claves)
-
-
-def responder_meta_turistica() -> str:
-    return (
-        "Soy tu asistente de turismo en Yucatan. "
-        "Mi enfoque es ayudarte con rutas, tiempos, clima, presupuesto y planes utiles para tu viaje. "
-        "Si quieres, te ayudo ahora con tu siguiente paso en Merida."
-    )
-
-
-def responder_capacidades(sender: str) -> str:
-    user = get_user(sender) or {}
-    municipality = user.get("municipality") or "Yucatan"
-    return (
-        f"Te puedo ayudar de forma personalizada para {municipality}: "
-        "planear rutas, calcular tiempos y distancias, sugerirte horarios ideales, "
-        "explicarte clima/precauciones, estimar presupuesto por tipo de plan, "
-        "armarte itinerarios (1 dia o fin de semana), y afinar opciones si viajas con ninos, pareja o adultos mayores.\n\n"
-        "Si quieres, empezamos con tu plan de hoy: dime zona, presupuesto aproximado y con quien viajas."
-    )
-
-
-def es_pregunta_logistica(text: str) -> bool:
-    t = normalize_text(text)
-    keywords = [
-        "como llegar",
-        "como llego",
-        "tiempo",
-        "cuanto tardo",
-        "cuanto tiempo",
-        "distancia",
-        "ruta",
-        "trafico",
-        "clima",
-        "precauciones",
-        "seguridad",
-    ]
-    return any(k in t for k in keywords)
-
-
-def actualizar_estilo_desde_texto(sender: str, text: str) -> None:
-    t = normalize_text(text)
-
-    if "formal" in t:
-        upsert_memory(sender, "tono_preferido", "formal", 4)
-    elif "casual" in t or "relajado" in t or "amigable" in t:
-        upsert_memory(sender, "tono_preferido", "casual", 4)
-
-    if "corto" in t or "breve" in t or "resumen" in t:
-        upsert_memory(sender, "detalle_preferido", "corto", 4)
-    elif "detallado" in t or "detalle" in t or "amplio" in t:
-        upsert_memory(sender, "detalle_preferido", "detallado", 4)
-
-
-def obtener_instrucciones_estilo(sender: str) -> str:
-    tono = (get_memory_value(sender, "tono_preferido") or "").strip().lower()
-    detalle = (get_memory_value(sender, "detalle_preferido") or "").strip().lower()
-
-    tono_inst = "tono profesional y cercano"
-    if tono == "formal":
-        tono_inst = "tono formal, claro y respetuoso"
-    elif tono == "casual":
-        tono_inst = "tono casual, fluido y natural"
-
-    detalle_inst = "respuesta breve y practica (5-9 lineas)"
-    if detalle == "corto":
-        detalle_inst = "respuesta corta (4-7 lineas) con lo esencial"
-    elif detalle == "detallado":
-        detalle_inst = "respuesta detallada con pasos claros y contexto util"
-
-    return (
-        f"Adapta la respuesta al usuario con {tono_inst} y {detalle_inst}. "
-        "Mantente estrictamente en turismo de Yucatan."
-    )
-
-
-def responder_chat_turismo(sender: str, text: str) -> str:
-    user = get_user(sender) or {}
-    municipality = user.get("municipality") or "sin definir"
-    location = get_latest_location(sender)
-
-    style_inst = obtener_instrucciones_estilo(sender)
-    context_short = contexto_compacto(sender)
-
-    # Contexto de lugares/tema segun la consulta.
-    candidates = obtener_lugares_relevantes(sender, text, limit=5)
-    if candidates and es_peticion_explicita_de_recomendacion(text):
-        guardar_ultimas_recomendaciones(sender, candidates)
-
-    places_lines = "\n".join(
-        [
-            f"- {p.get('nombre', '')} | {p.get('categoria', '')} | {p.get('municipio', '')} | {p.get('direccion', '')}"
-            for p in candidates[:5]
-        ]
-    ) or "- (sin lugares relevantes directos)"
-
-    # Si existe destino en contexto y el usuario pide logistica, inyecta datos duros.
-    destination = resolver_destino(sender, text)
-    logistics_block = "No aplica."
-    if destination and es_pregunta_logistica(text):
-        info = construir_info_destino_y_ruta(sender, destination)
-        weather = info.get("weather")
-        route = info.get("route")
-        clima_txt = "No disponible"
-        if weather:
-            code = int(weather.get("weather_code", -1))
-            clima_txt = (
-                f"{weather_label(code)} | {weather.get('temperature_2m', 'N/D')} C | "
-                f"precipitacion {weather.get('precipitation', 'N/D')} mm | "
-                f"viento {weather.get('wind_speed_10m', 'N/D')} km/h"
-            )
-        route_txt = "No disponible"
-        if route:
-            route_txt = f"{route.get('distance_km', 'N/D')} km | {route.get('duration_min', 'N/D')} min aprox"
-        logistics_block = (
-            f"Destino: {destination.get('nombre', '')}\n"
-            f"Municipio: {destination.get('municipio', '')}\n"
-            f"Direccion: {destination.get('direccion', '')}\n"
-            f"Ruta estimada: {route_txt}\n"
-            f"Navegacion: {info.get('directions', 'N/D')}\n"
-            f"Clima destino: {clima_txt}\n"
-            f"Precauciones base: {travel_advice(weather)}"
-        )
-
-    loc_txt = (
-        f"{round(location['lat'], 5)}, {round(location['lon'], 5)}"
-        if location
-        else "sin ubicacion compartida"
-    )
-
-    prompt = f"""
-{contexto_fecha_actual()}
-
-Consulta usuario:
-{text}
-
-Contexto usuario:
-- municipio_preferido: {municipality}
-- ubicacion_actual: {loc_txt}
-- estilo: {style_inst}
-
-Contexto compacto:
-{context_short}
-
-Lugares potencialmente relevantes:
-{places_lines}
-
-Bloque de logistica (si aplica):
-{logistics_block}
-
-Responde de forma conversacional e inteligente, como una IA premium.
-No hables de JSON, modos o reglas internas.
-Mantente 100% en turismo de Yucatan.
-"""
-    return responder_con_contexto(SYSTEM_PROMPT, prompt, smart=True, max_output_tokens=240)
-
-
-def procesar_texto_turistico(sender: str, text: str) -> str:
-    is_first_turn = len(get_recent_messages(sender, limit=1)) == 0
-    save_message(sender, "user", text, "text")
-    guardar_memoria_desde_texto(sender, text)
-    actualizar_estilo_desde_texto(sender, text)
-
-    user = get_user(sender)
-    if not user or is_first_turn:
-        return respuesta_primer_mensaje(sender)
-
-    municipio_detectado = detectar_municipio(text)
-    if municipio_detectado:
-        set_user_municipality(sender, municipio_detectado)
-        upsert_memory(sender, "municipio_preferido", municipio_detectado, 4)
-
-    t = normalize_text(text)
-    if es_pregunta_meta(text):
-        return responder_meta_turistica()
-
-    if "mas cerca" in t or "cerca de mi" in t or "cual me queda" in t:
-        cercano = responder_mas_cercano(sender, consulta=text)
-        if cercano:
-            return cercano
-
-    if "que mas puedes hacer" in t or "como me ayudas" in t or "en que me ayudas" in t:
-        return responder_capacidades(sender)
-    if is_exploratory_query(text):
-        tema = responder_tema_turistico(sender, text)
-        if tema:
-            return tema
-
-    if es_peticion_explicita_de_recomendacion(text):
-        respuesta_lugares = recomendar_lugares(sender, text)
-        if respuesta_lugares:
-            return respuesta_lugares
-
-    return responder_chat_turismo(sender, text)
+    except ChatbotAdminError as api_error:
+        return api_error.message
+    except Exception as exc:
+        print("ERROR EN PROCESO TAQUILLA:", exc)
+        return "Hubo un error interno procesando la solicitud."
 
 
 def obtener_display_name(value: dict[str, Any]) -> str | None:
@@ -805,8 +958,15 @@ def enviar_mensaje_whatsapp(numero: str, mensaje: str) -> None:
 
 
 @app.get("/")
-def health() -> dict[str, str]:
-    return {"status": "running", "bot": BOT_NAME}
+def health() -> dict[str, Any]:
+    return {
+        "status": "running",
+        "bot": BOT_NAME,
+        "admin_api_configured": ADMIN_API.configured,
+        "admin_api_base_url": ADMIN_API.base_url,
+        "admin_auth_mode": ADMIN_API.auth_mode,
+        "admin_token_len": len(ADMIN_API.token or ""),
+    }
 
 
 @app.get("/webhook")
@@ -844,82 +1004,36 @@ async def receive_message(request: Request):
 
                     if msg_type == "text":
                         text = message.get("text", {}).get("body", "")
-                        respuesta_final = procesar_texto_turistico(sender, text)
-
-                    elif msg_type == "image":
-                        media_id = message.get("image", {}).get("id")
-                        image_bytes = descargar_media(media_id) if media_id else None
-                        if image_bytes:
-                            descripcion = procesar_imagen(image_bytes)
-                            save_message(sender, "user", "[imagen] " + descripcion, "image")
-                            respuesta_final = procesar_texto_turistico(
-                                sender,
-                                f"El usuario compartio una imagen. Descripcion: {descripcion}",
-                            )
-                        else:
-                            respuesta_final = "No pude descargar la imagen. Intenta de nuevo."
+                        respuesta_final = procesar_texto_taquilla(sender, text, "text")
 
                     elif msg_type == "audio":
                         media_id = message.get("audio", {}).get("id")
                         audio_bytes = descargar_media(media_id) if media_id else None
                         if audio_bytes:
                             texto_audio = transcribir_audio(audio_bytes)
-                            save_message(sender, "user", "[audio] " + texto_audio, "audio")
-                            respuesta_final = procesar_texto_turistico(sender, texto_audio)
+                            respuesta_final = procesar_texto_taquilla(sender, texto_audio, "audio")
                         else:
                             respuesta_final = "No pude descargar el audio. Intenta de nuevo."
 
-                    elif msg_type == "location":
-                        loc = message.get("location", {})
-                        lat = loc.get("latitude")
-                        lon = loc.get("longitude")
-                        if lat is not None and lon is not None:
-                            save_location(sender, float(lat), float(lon), "whatsapp_location")
-                            upsert_memory(sender, "ultima_ubicacion", f"{lat},{lon}", 5)
-                            pending_action = get_memory_value(sender, "pending_action") or ""
-                            if pending_action == "resolve_nearest":
-                                respuesta_final = responder_mas_cercano(sender) or (
-                                    "Ubicacion guardada. Que tipo de lugar te interesa para calcular cercania exacta?"
-                                )
-                            else:
-                                respuesta_final = (
-                                    "Ubicacion guardada. Ahora puedo recomendarte lugares cercanos con distancia, "
-                                    "link de Maps y telefono directo.\n\n"
-                                    "Dime que buscas: cenotes, restaurantes, haciendas, museos o playas."
-                                )
+                    elif msg_type == "image":
+                        media_id = message.get("image", {}).get("id")
+                        image_bytes = descargar_media(media_id) if media_id else None
+                        if image_bytes:
+                            descripcion = procesar_imagen(image_bytes)
+                            respuesta_final = procesar_texto_taquilla(sender, descripcion, "image")
                         else:
-                            respuesta_final = "No recibi coordenadas validas de ubicacion."
+                            respuesta_final = "No pude descargar la imagen. Intenta de nuevo."
 
                     elif msg_type == "document":
-                        document = message.get("document", {})
-                        mime_type = document.get("mime_type")
-                        media_id = document.get("id")
-                        if mime_type == "application/pdf" and media_id:
-                            pdf_bytes = descargar_media(media_id)
-                            if pdf_bytes:
-                                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                                    tmp.write(pdf_bytes)
-                                    temp_path = tmp.name
-                                try:
-                                    analisis = procesar_pdf(temp_path)
-                                finally:
-                                    try:
-                                        os.remove(temp_path)
-                                    except OSError:
-                                        pass
-                                save_message(sender, "user", "[documento pdf]", "document")
-                                respuesta_final = procesar_texto_turistico(
-                                    sender,
-                                    f"El usuario compartio un PDF. Resumen: {analisis}",
-                                )
-                            else:
-                                respuesta_final = "No pude descargar el PDF. Intenta nuevamente."
-                        else:
-                            respuesta_final = "Solo se soportan documentos PDF."
+                        respuesta_final = (
+                            "Para reimpresion PDF usa busqueda de ventas, por ejemplo:\n"
+                            "- Buscar venta referencia ABC123\n"
+                            "- Buscar venta email cliente@dominio.com"
+                        )
 
                     else:
                         respuesta_final = (
-                            "Tipo de mensaje no soportado aun. Puedes enviarme texto, imagen, audio, ubicacion o PDF."
+                            "Tipo de mensaje no soportado aun. Envia texto, audio o imagen."
                         )
 
                     if respuesta_final:
