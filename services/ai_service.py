@@ -20,13 +20,19 @@ def procesar_texto(prompt: str, smart: bool = False) -> str:
     return response.output_text
 
 
-def responder_con_contexto(system_prompt: str, user_prompt: str, smart: bool = True) -> str:
+def responder_con_contexto(
+    system_prompt: str,
+    user_prompt: str,
+    smart: bool = True,
+    max_output_tokens: int = 260,
+) -> str:
     response = client.responses.create(
         model=MODEL_SMART if smart else MODEL_FAST,
         input=[
             {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
             {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
         ],
+        max_output_tokens=max_output_tokens,
     )
     return response.output_text
 

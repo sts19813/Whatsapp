@@ -57,7 +57,7 @@ BASE_PATH = Path("base_turismo_yucatan_inventur.json")
 with BASE_PATH.open(encoding="utf-8") as f:
     BASE_TURISMO = json.load(f)
 
-BOT_NAME = "Itzamna AI Turismo Yucatan"
+BOT_NAME = "Kiro AI Turismo Yucatan"
 MUNICIPIOS_CLAVE = [
     "merida",
     "progreso",
@@ -71,10 +71,10 @@ MUNICIPIOS_CLAVE = [
 ]
 
 SYSTEM_PROMPT = """
-Eres un asesor conversacional de alto nivel, especializado unicamente en turismo en Yucatan.
-Habla como una IA natural (estilo ChatGPT), no como bot de respuestas rigidas.
+Eres un asesor de turismo de alto nivel, especializado unicamente en turismo en Yucatan.
+Habla como una IA natural, no como bot de respuestas rigidas.
 Tu prioridad es la mejor experiencia del viajero: claridad, utilidad, logistica, seguridad y contexto real.
-Siempre responde en espanol.
+Siempre responde en idioma del usuario.
 
 Reglas:
 1) Mantente estrictamente en turismo de Yucatan. Si preguntan algo fuera de eso, redirige con elegancia al contexto turistico yucateco.
@@ -82,6 +82,7 @@ Reglas:
 3) Si hay destino concreto, prioriza: como llegar, tiempo estimado, clima, precauciones, costos orientativos y siguiente mejor accion.
 4) Si faltan datos exactos, dilo claramente y propone la forma mas rapida de validarlo.
 5) Usa la fecha local proporcionada para interpretar "hoy", "estas fechas", "manana", etc.
+6) Responde breve por defecto (2-5 lineas). Solo extiende si el usuario pide detalle. no pongas # ni emojis en la respuesta
 """.strip()
 
 
@@ -140,6 +141,47 @@ def construir_contexto_usuario(sender: str) -> str:
         f"Ubicacion actual: {loc_txt}\n"
         f"Memorias:\n{memoria_txt}\n\n"
         f"Historial reciente:\n{mensajes_txt}"
+    )
+
+
+def truncar_texto(texto: str, max_chars: int = 220) -> str:
+    clean = " ".join((texto or "").split())
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 3] + "..."
+
+
+def contexto_compacto(sender: str) -> str:
+    user = get_user(sender) or {}
+    memories = get_memories(sender, limit=12)
+    recent = get_recent_messages(sender, limit=6)
+    location = get_latest_location(sender)
+
+    memory_importantes = []
+    for m in memories:
+        key = (m.get("key") or "").strip()
+        if key in {"last_recommendations"}:
+            continue
+        memory_importantes.append(f"- {key}: {truncar_texto(m.get('value', ''), 120)}")
+
+    if get_memory_value(sender, "last_recommendations"):
+        memory_importantes.append("- last_recommendations: disponible")
+
+    recent_compacto = []
+    for msg in recent[-4:]:
+        role = msg.get("role", "user")
+        content = truncar_texto(msg.get("content", ""), 180)
+        recent_compacto.append(f"{role}: {content}")
+
+    loc_txt = f"{round(location['lat'], 5)}, {round(location['lon'], 5)}" if location else "sin ubicacion"
+    memories_txt = "\n".join(memory_importantes) or "- (sin datos)"
+    recent_txt = "\n".join(recent_compacto) or "(sin historial)"
+
+    return (
+        f"municipio_preferido: {user.get('municipality', 'sin definir')}\n"
+        f"ubicacion_actual: {loc_txt}\n"
+        f"memoria_clave:\n{memories_txt}\n"
+        f"historial_corto:\n{recent_txt}"
     )
 
 
@@ -395,8 +437,7 @@ def responder_detalle_destino(sender: str, consulta: str, destino_hint: str = ""
     weather = info["weather"]
     route = info["route"]
     user = get_user(sender) or {}
-    memories = get_memories(sender, limit=8)
-    memory_lines = "\n".join([f"- {m['key']}: {m['value']}" for m in memories]) or "- (sin datos)"
+    memory_lines = contexto_compacto(sender)
 
     clima_txt = "No disponible"
     if weather:
@@ -445,7 +486,7 @@ Enfocate en valor practico para este destino: costos estimados, mejores horarios
 Si un dato no existe en la base, dilo y sugiere como validarlo rapido.
 {style_inst}
 """
-    return responder_con_contexto(SYSTEM_PROMPT, prompt_usuario, smart=True)
+    return responder_con_contexto(SYSTEM_PROMPT, prompt_usuario, smart=True, max_output_tokens=260)
 
 
 def responder_tema_turistico(sender: str, consulta: str) -> str | None:
@@ -461,8 +502,7 @@ def responder_tema_turistico(sender: str, consulta: str) -> str | None:
         [f"- {p.get('nombre', '')} ({p.get('municipio', '')})" for p in muestras]
     ) or "- Sin ejemplos cercanos en base"
 
-    memories = get_memories(sender, limit=8)
-    memory_lines = "\n".join([f"- {m['key']}: {m['value']}" for m in memories]) or "- (sin datos)"
+    memory_lines = contexto_compacto(sender)
 
     style_inst = obtener_instrucciones_estilo(sender)
     prompt = f"""
@@ -485,14 +525,14 @@ Si no hay dato exacto (precio/horario), dilo y propone como validarlo rapido.
 Cierra con una sola pregunta de seguimiento util.
 {style_inst}
 """
-    return responder_con_contexto(SYSTEM_PROMPT, prompt, smart=True)
+    return responder_con_contexto(SYSTEM_PROMPT, prompt, smart=True, max_output_tokens=240)
 
 
 def respuesta_primer_mensaje(sender: str, display_name: str | None = None) -> str:
     upsert_user(sender, display_name=display_name)
     upsert_memory(sender, "primer_contacto", "Usuario inicio conversacion", 3)
     return (
-        "Hola, soy Itzamna AI, tu asistente premium de turismo en Yucatan.\n\n"
+        "Hola, soy Kiro AI, tu asistente de turismo en Yucatan.\n\n"
         "Ya guarde tu perfil inicial para personalizar recomendaciones.\n"
         "Comparte tu ubicacion de WhatsApp para recomendar lugares cercanos con distancia y links de Maps.\n\n"
         "Tambien puedes decirme: presupuesto, intereses (cenotes, gastronomia, arqueologia),"
@@ -513,6 +553,25 @@ def es_peticion_explicita_de_recomendacion(text: str) -> bool:
         "cerca de mi",
     ]
     return any(k in t for k in triggers)
+
+
+def es_pregunta_meta(text: str) -> bool:
+    t = normalize_text(text)
+    claves = [
+        "quien te creo",
+        "que modelo eres",
+        "eres chatgpt",
+        "quien eres",
+    ]
+    return any(k in t for k in claves)
+
+
+def responder_meta_turistica() -> str:
+    return (
+        "Soy tu asistente de turismo en Yucatan. "
+        "Mi enfoque es ayudarte con rutas, tiempos, clima, presupuesto y planes utiles para tu viaje. "
+        "Si quieres, te ayudo ahora con tu siguiente paso en Merida."
+    )
 
 
 def responder_capacidades(sender: str) -> str:
@@ -569,7 +628,7 @@ def obtener_instrucciones_estilo(sender: str) -> str:
     elif tono == "casual":
         tono_inst = "tono casual, fluido y natural"
 
-    detalle_inst = "nivel de detalle medio, muy practico"
+    detalle_inst = "respuesta breve y practica (5-9 lineas)"
     if detalle == "corto":
         detalle_inst = "respuesta corta (4-7 lineas) con lo esencial"
     elif detalle == "detallado":
@@ -587,10 +646,7 @@ def responder_chat_turismo(sender: str, text: str) -> str:
     location = get_latest_location(sender)
 
     style_inst = obtener_instrucciones_estilo(sender)
-    memories = get_memories(sender, limit=10)
-    memory_lines = "\n".join([f"- {m['key']}: {m['value']}" for m in memories]) or "- (sin datos)"
-    recent = get_recent_messages(sender, limit=10)
-    recent_lines = "\n".join([f"{m['role']}: {m['content']}" for m in recent]) or "(sin historial)"
+    context_short = contexto_compacto(sender)
 
     # Contexto de lugares/tema segun la consulta.
     candidates = obtener_lugares_relevantes(sender, text, limit=5)
@@ -649,11 +705,8 @@ Contexto usuario:
 - ubicacion_actual: {loc_txt}
 - estilo: {style_inst}
 
-Memoria util:
-{memory_lines}
-
-Historial reciente:
-{recent_lines}
+Contexto compacto:
+{context_short}
 
 Lugares potencialmente relevantes:
 {places_lines}
@@ -665,7 +718,7 @@ Responde de forma conversacional e inteligente, como una IA premium.
 No hables de JSON, modos o reglas internas.
 Mantente 100% en turismo de Yucatan.
 """
-    return responder_con_contexto(SYSTEM_PROMPT, prompt, smart=True)
+    return responder_con_contexto(SYSTEM_PROMPT, prompt, smart=True, max_output_tokens=240)
 
 
 def procesar_texto_turistico(sender: str, text: str) -> str:
@@ -684,6 +737,9 @@ def procesar_texto_turistico(sender: str, text: str) -> str:
         upsert_memory(sender, "municipio_preferido", municipio_detectado, 4)
 
     t = normalize_text(text)
+    if es_pregunta_meta(text):
+        return responder_meta_turistica()
+
     if "mas cerca" in t or "cerca de mi" in t or "cual me queda" in t:
         cercano = responder_mas_cercano(sender, consulta=text)
         if cercano:
